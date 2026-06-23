@@ -249,51 +249,90 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
-
+	// 1) del_flg=0 のユーザーの投稿だけを postsPerPage 件まで採用する（元の挙動を踏襲）
+	var selected []Post
 	for _, p := range results {
-		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
+		u, err := getUserByID(ctx, p.UserID)
 		if err != nil {
 			return nil, err
 		}
+		if u.DelFlg != 0 {
+			continue
+		}
+		p.User = u
+		p.CSRFToken = csrfToken
+		selected = append(selected, p)
+		if len(selected) >= postsPerPage {
+			break
+		}
+	}
+	if len(selected) == 0 {
+		return []Post{}, nil
+	}
 
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
+	postIDs := make([]int, len(selected))
+	for i := range selected {
+		postIDs[i] = selected[i].ID
+	}
+
+	// 2) コメント数を1クエリで一括集計（投稿ごとの COUNT N+1 を排除）
+	countMap := map[int]int{}
+	{
+		type commentCount struct {
+			PostID int `db:"post_id"`
+			Count  int `db:"count"`
+		}
+		q, args, err := sqlx.In("SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`", postIDs)
+		if err != nil {
+			return nil, err
+		}
+		var counts []commentCount
+		if err := db.SelectContext(ctx, &counts, q, args...); err != nil {
+			return nil, err
+		}
+		for _, c := range counts {
+			countMap[c.PostID] = c.Count
+		}
+	}
+
+	// 3) コメント本体を1クエリで一括取得（一覧は各投稿の新着3件、詳細は全件）
+	commentsByPost := map[int][]Comment{}
+	{
+		var q string
+		var args []interface{}
+		var err error
+		if allComments {
+			q, args, err = sqlx.In("SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM `comments` WHERE `post_id` IN (?) ORDER BY `created_at` DESC", postIDs)
+		} else {
+			// 各 post_id ごとの新着3件をウィンドウ関数で取得
+			q, args, err = sqlx.In("SELECT `id`, `post_id`, `user_id`, `comment`, `created_at` FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY `post_id` ORDER BY `created_at` DESC) AS `rn` FROM `comments` WHERE `post_id` IN (?)) `t` WHERE `rn` <= 3 ORDER BY `created_at` DESC", postIDs)
+		}
+		if err != nil {
+			return nil, err
 		}
 		var comments []Comment
-		err = db.SelectContext(ctx, &comments, query, p.ID)
-		if err != nil {
+		if err := db.SelectContext(ctx, &comments, q, args...); err != nil {
 			return nil, err
 		}
-
 		for i := range comments {
 			comments[i].User, err = getUserByID(ctx, comments[i].UserID)
 			if err != nil {
 				return nil, err
 			}
+			commentsByPost[comments[i].PostID] = append(commentsByPost[comments[i].PostID], comments[i])
 		}
+	}
 
-		// reverse
+	// 4) 組み立て（コメントは created_at DESC で集めたので表示用に昇順へ反転）
+	posts := make([]Post, 0, len(selected))
+	for _, p := range selected {
+		p.CommentCount = countMap[p.ID]
+		comments := commentsByPost[p.ID]
 		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
 			comments[i], comments[j] = comments[j], comments[i]
 		}
-
 		p.Comments = comments
-
-		p.User, err = getUserByID(ctx, p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
-		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
-		if len(posts) >= postsPerPage {
-			break
-		}
+		posts = append(posts, p)
 	}
 
 	return posts, nil
