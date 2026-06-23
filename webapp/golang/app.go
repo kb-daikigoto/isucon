@@ -204,6 +204,20 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
+	// 同一リクエスト内でユーザー取得をメモ化し、users への N+1 を抑える
+	userCache := map[int]User{}
+	getUser := func(id int) (User, error) {
+		if u, ok := userCache[id]; ok {
+			return u, nil
+		}
+		var u User
+		if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", id); err != nil {
+			return u, err
+		}
+		userCache[id] = u
+		return u, nil
+	}
+
 	for _, p := range results {
 		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
 		if err != nil {
@@ -221,7 +235,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		}
 
 		for i := range comments {
-			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
+			comments[i].User, err = getUser(comments[i].UserID)
 			if err != nil {
 				return nil, err
 			}
@@ -234,7 +248,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 
 		p.Comments = comments
 
-		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+		p.User, err = getUser(p.UserID)
 		if err != nil {
 			return nil, err
 		}
@@ -420,7 +434,9 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
+	// del_flg=0 のユーザーの投稿だけを新着順に postsPerPage 件取得する。
+	// users と JOIN して SQL 側で絞り込み、posts の全件スキャンを避ける。
+	err := db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -556,7 +572,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601Format))
+	err = db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 AND p.`created_at` <= ? ORDER BY p.`created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
