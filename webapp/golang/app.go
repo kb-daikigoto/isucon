@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"path"
@@ -119,6 +120,10 @@ type Post struct {
 	Comments     []Comment
 	User         User
 	CSRFToken    string
+	// テンプレートでの reflect 経由の関数/メソッド呼び出し(imageURL, CreatedAt.Format)を
+	// 避けるため Go 側で事前計算しておく。出力は従来と同一。
+	ImageURL     string
+	CreatedAtFmt string
 }
 
 type Comment struct {
@@ -375,6 +380,9 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 			comments[i], comments[j] = comments[j], comments[i]
 		}
 		p.Comments = comments
+		// テンプレート描画時の reflect 呼び出しを避けるため事前計算
+		p.ImageURL = imageURL(p)
+		p.CreatedAtFmt = p.CreatedAt.Format("2006-01-02T15:04:05-07:00")
 		posts = append(posts, p)
 	}
 
@@ -1036,6 +1044,11 @@ func main() {
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
 	r.Mount("/", http.FileServer(http.Dir("../public")))
+
+	// pprof（計測用・localhostのみ。本番URLには影響しない）
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
