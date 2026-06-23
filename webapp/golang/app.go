@@ -158,8 +158,9 @@ func dbInitialize(ctx context.Context) {
 	// 初期化で users の削除・del_flg 更新が走るため、キャッシュを破棄する
 	clearUserCache()
 
-	// ベンチのアップロードで作られた id>10000 の画像ファイルを掃除し、ディスク肥大を防ぐ。
-	// 対応する posts は上の DELETE で消えており、必要になれば write-through で再生成される。
+	// ベンチのアップロードで作られた id>10000 の画像ファイルを掃除しつつ、
+	// ディスク上に存在する画像 id を集める。
+	present := map[int]bool{}
 	if entries, err := os.ReadDir(imageDir); err == nil {
 		for _, e := range entries {
 			name := e.Name()
@@ -167,8 +168,45 @@ func dbInitialize(ctx context.Context) {
 			if dot <= 0 {
 				continue
 			}
-			if id, err := strconv.Atoi(name[:dot]); err == nil && id > 10000 {
+			id, err := strconv.Atoi(name[:dot])
+			if err != nil {
+				continue
+			}
+			if id > 10000 {
 				os.Remove(imageDir + "/" + name)
+			} else {
+				present[id] = true
+			}
+		}
+	}
+
+	// 初期データ(id<=10000)の画像をすべてファイル化しておく。これにより全画像を
+	// nginx が直接配信でき、getImage 経由の imgdata(BLOB) 読み込みが発生しなくなる
+	// （= 巨大 BLOB がバッファプールを汚さない）。ファイルが既にあるものは skip するので
+	// 通常は DB アクセスゼロ。dump 直後など未生成の場合だけ materialize する。
+	var metas []Post
+	if err := db.SelectContext(ctx, &metas, "SELECT `id`, `mime` FROM `posts` WHERE `id` <= 10000"); err == nil {
+		for _, m := range metas {
+			if present[m.ID] {
+				continue
+			}
+			ext := ""
+			switch m.Mime {
+			case "image/jpeg":
+				ext = "jpg"
+			case "image/png":
+				ext = "png"
+			case "image/gif":
+				ext = "gif"
+			default:
+				continue
+			}
+			var img []byte
+			if err := db.GetContext(ctx, &img, "SELECT `imgdata` FROM `posts` WHERE `id` = ?", m.ID); err != nil {
+				continue
+			}
+			if err := writeImageFile(m.ID, ext, img); err != nil {
+				log.Print(err)
 			}
 		}
 	}
@@ -677,7 +715,9 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	// imgdata(BLOB)は描画に不要なので取得しない。SELECT * だと巨大なBLOBを毎回
+	// バッファプールへ載せ、ホットなメタデータページを追い出していた。
+	err = db.SelectContext(ctx, &results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -762,13 +802,16 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 画像はファイル(public/image/)に書き出して nginx が直接配信する。DBには
+	// imgdata BLOB を保存しない(空)。posts テーブルを小さく保ち、バッファプールに
+	// 完全常駐させるため。INSERT の書込量も大幅に減る。
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := db.ExecContext(
 		ctx,
 		query,
 		me.ID,
 		mime,
-		filedata,
+		[]byte{},
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -808,8 +851,10 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 必要なのは mime と imgdata だけ。通常はファイルが存在し nginx が直接配信する
+	// ため、ここに来るのはファイル未生成の初回のみ。
 	post := Post{}
-	err = db.GetContext(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.GetContext(ctx, &post, "SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
