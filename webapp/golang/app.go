@@ -402,6 +402,75 @@ func imageURL(p Post) string {
 	return "/image/" + strconv.Itoa(p.ID) + ext
 }
 
+// renderPost は post.html 相当のHTMLを html/template を介さず手動生成する。
+// html/template の reflect 経由 auto-escape と木の walk が app CPU の最大要因
+// （約35%）だったため、ホットな投稿一覧の描画だけ手書きに置き換える。
+// ユーザ入力(Body/Comment/AccountName)は template.HTMLEscapeString でエスケープ。
+// 出力DOM（要素/属性/テキスト）は post.html と等価。
+func renderPost(sb *strings.Builder, p Post) {
+	id := strconv.Itoa(p.ID)
+	acc := template.HTMLEscapeString(p.User.AccountName)
+	// html/template は属性値の '+' を &#43; にエスケープする。出力を完全一致させる。
+	cat := strings.ReplaceAll(p.CreatedAtFmt, "+", "&#43;")
+	sb.WriteString(`<div class="isu-post" id="pid_`)
+	sb.WriteString(id)
+	sb.WriteString(`" data-created-at="`)
+	sb.WriteString(cat)
+	sb.WriteString("\">\n  <div class=\"isu-post-header\">\n    <a href=\"/@")
+	sb.WriteString(acc)
+	sb.WriteString(` " class="isu-post-account-name">`)
+	sb.WriteString(acc)
+	sb.WriteString("</a>\n    <a href=\"/posts/")
+	sb.WriteString(id)
+	sb.WriteString("\" class=\"isu-post-permalink\">\n      <time class=\"timeago\" datetime=\"")
+	sb.WriteString(cat)
+	sb.WriteString("\"></time>\n    </a>\n  </div>\n  <div class=\"isu-post-image\">\n    <img src=\"")
+	sb.WriteString(template.HTMLEscapeString(p.ImageURL))
+	sb.WriteString("\" class=\"isu-image\">\n  </div>\n  <div class=\"isu-post-text\">\n    <a href=\"/@")
+	sb.WriteString(acc)
+	sb.WriteString(`" class="isu-post-account-name">`)
+	sb.WriteString(acc)
+	sb.WriteString("</a>\n    ")
+	sb.WriteString(template.HTMLEscapeString(p.Body))
+	sb.WriteString("\n  </div>\n  <div class=\"isu-post-comment\">\n    <div class=\"isu-post-comment-count\">\n      comments: <b>")
+	sb.WriteString(strconv.Itoa(p.CommentCount))
+	sb.WriteString("</b>\n    </div>\n\n")
+	for _, c := range p.Comments {
+		cacc := template.HTMLEscapeString(c.User.AccountName)
+		sb.WriteString("    <div class=\"isu-comment\">\n      <a href=\"/@")
+		sb.WriteString(cacc)
+		sb.WriteString(`" class="isu-comment-account-name">`)
+		sb.WriteString(cacc)
+		sb.WriteString("</a>\n      <span class=\"isu-comment-text\">")
+		sb.WriteString(template.HTMLEscapeString(c.Comment))
+		sb.WriteString("</span>\n    </div>\n")
+	}
+	sb.WriteString("    <div class=\"isu-comment-form\">\n      <form method=\"post\" action=\"/comment\">\n        <input type=\"text\" name=\"comment\">\n        <input type=\"hidden\" name=\"post_id\" value=\"")
+	sb.WriteString(id)
+	sb.WriteString("\">\n        <input type=\"hidden\" name=\"csrf_token\" value=\"")
+	sb.WriteString(template.HTMLEscapeString(p.CSRFToken))
+	sb.WriteString("\">\n        <input type=\"submit\" name=\"submit\" value=\"submit\">\n      </form>\n    </div>\n  </div>\n</div>\n")
+}
+
+// renderPostsList は posts.html 相当（<div class="isu-posts"> ラッパ + 各 post）を生成。
+func renderPostsList(posts []Post) template.HTML {
+	var sb strings.Builder
+	sb.WriteString("<div class=\"isu-posts\">\n")
+	for _, p := range posts {
+		sb.WriteString("  ")
+		renderPost(&sb, p)
+	}
+	sb.WriteString("</div>\n")
+	return template.HTML(sb.String())
+}
+
+// renderSinglePost は post_id.html 相当（ラッパ無しの単一 post）を生成。
+func renderSinglePost(p Post) template.HTML {
+	var sb strings.Builder
+	renderPost(&sb, p)
+	return template.HTML(sb.String())
+}
+
 func isLogin(u User) bool {
 	return u.ID != 0
 }
@@ -588,11 +657,11 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmplIndex.Execute(w, struct {
-		Posts     []Post
+		PostsHTML template.HTML
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	}{renderPostsList(posts), me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -664,13 +733,13 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
 	tmplAccount.Execute(w, struct {
-		Posts          []Post
+		PostsHTML      template.HTML
 		User           User
 		PostCount      int
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{renderPostsList(posts), user, postCount, commentCount, commentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -710,7 +779,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmplPosts.Execute(w, posts)
+	w.Write([]byte(renderPostsList(posts)))
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -747,9 +816,9 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
 	tmplPostID.Execute(w, struct {
-		Post Post
-		Me   User
-	}{p, me})
+		PostHTML template.HTML
+		Me       User
+	}{renderSinglePost(p), me})
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
