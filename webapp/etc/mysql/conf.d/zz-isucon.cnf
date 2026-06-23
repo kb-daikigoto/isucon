@@ -1,0 +1,16 @@
+# private-isu チューニング用 MySQL 設定（本番反映先: /etc/mysql/conf.d/zz-isucon.cnf）
+# 再起動耐性あり。サーバの /etc/mysql/conf.d/ に配置して mysql を再起動する。
+[mysqld]
+# バイナリログ無効化(レプリケーション不使用)。binlog蓄積によるディスク枯渇対策＋書込I/O削減。
+disable_log_bin
+
+# 第10回: InnoDBバッファプール拡大。posts(imgdata BLOB)が1.5GBあるのに既定128MBで
+# ワーキングセットが収まらずディスクI/O律速だった。3.7GB RAMのため安全側で1024Mに設定
+# (chunk×instances=1024M単位に丸められる。1280M指定だと2048Mに切り上がり危険)。
+innodb_buffer_pool_size = 1024M
+# コミットごとのfsyncをやめOSキャッシュ経由(1秒ごとflush)。graceful restartには耐える。INSERT高速化。
+innodb_flush_log_at_trx_commit = 2
+# データファイルI/OでOSページキャッシュ二重化を避ける(画像ファイルのページキャッシュと競合させない)。
+innodb_flush_method = O_DIRECT
+# doublewrite無効化で書込量半減(ISUCONはクラッシュ復旧不要)。
+innodb_doublewrite = 0
