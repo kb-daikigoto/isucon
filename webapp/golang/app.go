@@ -436,7 +436,9 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	// del_flg=0 のユーザーの投稿だけを新着順に postsPerPage 件取得する。
 	// users と JOIN して SQL 側で絞り込み、posts の全件スキャンを避ける。
-	err := db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT ?", postsPerPage)
+	// posts(user_id) 系の索引が増えるとオプティマイザが users 全走査の悪いプランを
+	// 選ぶため、新着順の索引を FORCE INDEX で固定する。
+	err := db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p FORCE INDEX (idx_created_at) JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 ORDER BY p.`created_at` DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -572,7 +574,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 AND p.`created_at` <= ? ORDER BY p.`created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
+	err = db.SelectContext(ctx, &results, "SELECT p.`id`, p.`user_id`, p.`body`, p.`mime`, p.`created_at` FROM `posts` p FORCE INDEX (idx_created_at) JOIN `users` u ON p.`user_id` = u.`id` WHERE u.`del_flg` = 0 AND p.`created_at` <= ? ORDER BY p.`created_at` DESC LIMIT ?", t.Format(ISO8601Format), postsPerPage)
 	if err != nil {
 		log.Print(err)
 		return
@@ -902,6 +904,8 @@ func main() {
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.Local
+	// クライアント側でプレースホルダを展開し、毎クエリの PREPARE 往復(ADMIN PREPARE)を無くす
+	cfg.InterpolateParams = true
 	dsn := cfg.FormatDSN()
 
 	db, err = sqlx.Open("mysql", dsn)
