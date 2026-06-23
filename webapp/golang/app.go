@@ -157,6 +157,21 @@ func dbInitialize(ctx context.Context) {
 
 	// 初期化で users の削除・del_flg 更新が走るため、キャッシュを破棄する
 	clearUserCache()
+
+	// ベンチのアップロードで作られた id>10000 の画像ファイルを掃除し、ディスク肥大を防ぐ。
+	// 対応する posts は上の DELETE で消えており、必要になれば write-through で再生成される。
+	if entries, err := os.ReadDir(imageDir); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			dot := strings.IndexByte(name, '.')
+			if dot <= 0 {
+				continue
+			}
+			if id, err := strconv.Atoi(name[:dot]); err == nil && id > 10000 {
+				os.Remove(imageDir + "/" + name)
+			}
+		}
+	}
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
