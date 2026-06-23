@@ -34,7 +34,33 @@ const (
 	postsPerPage  = 20
 	ISO8601Format = "2006-01-02T15:04:05-07:00"
 	UploadLimit   = 10 * 1024 * 1024 // 10mb
+	imageDir      = "../public/image"
 )
+
+// writeImageFile は画像をファイルに書き出す。以降の同一画像へのリクエストは
+// nginx が public/image/ から直接配信し、アプリと DB の負荷を肩代わりする。
+// 部分的に書きかけのファイルを nginx が配信しないよう、一時ファイルへ書いてから rename する。
+func writeImageFile(id int, ext string, data []byte) error {
+	if ext == "" {
+		return nil
+	}
+	f, err := os.CreateTemp(imageDir, "tmp-")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	f.Chmod(0644)
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, fmt.Sprintf("%s/%d.%s", imageDir, id, ext))
+}
 
 type User struct {
 	ID          int       `db:"id"`
@@ -680,6 +706,20 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// POST 直後の GET で参照できるよう、アップロード画像をファイルにも書き出す
+	ext := ""
+	switch mime {
+	case "image/jpeg":
+		ext = "jpg"
+	case "image/png":
+		ext = "png"
+	case "image/gif":
+		ext = "gif"
+	}
+	if err := writeImageFile(int(pid), ext, filedata); err != nil {
+		log.Print(err)
+	}
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -704,6 +744,10 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
+		// 初回アクセス時にファイルへ書き出し、以降は nginx が直接配信する
+		if err := writeImageFile(pid, ext, post.Imgdata); err != nil {
+			log.Print(err)
+		}
 		w.Header().Set("Content-Type", post.Mime)
 		_, err := w.Write(post.Imgdata)
 		if err != nil {
