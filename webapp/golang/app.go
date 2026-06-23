@@ -15,6 +15,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -28,7 +29,42 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+
+	// users はBAN・登録以外ほぼ不変なので、id 引きをアプリ内にキャッシュする。
+	// DBが正で、変更時(BAN/初期化)に無効化することで整合性を保つ。
+	userCacheMu sync.RWMutex
+	userCache   = map[int]User{}
 )
+
+func getUserByID(ctx context.Context, id int) (User, error) {
+	userCacheMu.RLock()
+	u, ok := userCache[id]
+	userCacheMu.RUnlock()
+	if ok {
+		return u, nil
+	}
+
+	var nu User
+	if err := db.GetContext(ctx, &nu, "SELECT * FROM `users` WHERE `id` = ?", id); err != nil {
+		return nu, err
+	}
+	userCacheMu.Lock()
+	userCache[id] = nu
+	userCacheMu.Unlock()
+	return nu, nil
+}
+
+func invalidateUserCache(id int) {
+	userCacheMu.Lock()
+	delete(userCache, id)
+	userCacheMu.Unlock()
+}
+
+func clearUserCache() {
+	userCacheMu.Lock()
+	userCache = map[int]User{}
+	userCacheMu.Unlock()
+}
 
 const (
 	postsPerPage  = 20
@@ -117,6 +153,9 @@ func dbInitialize(ctx context.Context) {
 	for _, sql := range sqls {
 		db.ExecContext(ctx, sql)
 	}
+
+	// 初期化で users の削除・del_flg 更新が走るため、キャッシュを破棄する
+	clearUserCache()
 }
 
 func tryLogin(ctx context.Context, accountName, password string) *User {
@@ -178,9 +217,17 @@ func getSessionUser(r *http.Request) User {
 		return User{}
 	}
 
-	u := User{}
+	id, ok := uid.(int)
+	if !ok {
+		switch v := uid.(type) {
+		case int64:
+			id = int(v)
+		default:
+			return User{}
+		}
+	}
 
-	err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid)
+	u, err := getUserByID(ctx, id)
 	if err != nil {
 		return User{}
 	}
@@ -204,20 +251,6 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
-	// 同一リクエスト内でユーザー取得をメモ化し、users への N+1 を抑える
-	userCache := map[int]User{}
-	getUser := func(id int) (User, error) {
-		if u, ok := userCache[id]; ok {
-			return u, nil
-		}
-		var u User
-		if err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", id); err != nil {
-			return u, err
-		}
-		userCache[id] = u
-		return u, nil
-	}
-
 	for _, p := range results {
 		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
 		if err != nil {
@@ -235,7 +268,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		}
 
 		for i := range comments {
-			comments[i].User, err = getUser(comments[i].UserID)
+			comments[i].User, err = getUserByID(ctx, comments[i].UserID)
 			if err != nil {
 				return nil, err
 			}
@@ -248,7 +281,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 
 		p.Comments = comments
 
-		p.User, err = getUser(p.UserID)
+		p.User, err = getUserByID(ctx, p.UserID)
 		if err != nil {
 			return nil, err
 		}
@@ -865,6 +898,10 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.ExecContext(ctx, query, 1, id)
+		// BAN したユーザーは del_flg が変わるのでキャッシュを無効化する
+		if n, err := strconv.Atoi(id); err == nil {
+			invalidateUserCache(n)
+		}
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
